@@ -1,0 +1,225 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import argparse
+from resnet_SFFM import *
+import torch.nn.functional as F
+from autoaugment import CIFAR10Policy
+from cutout import Cutout
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+parser = argparse.ArgumentParser(description='ETSKD CIFAR Training')
+parser.add_argument('--model', default="resnet18", type=str, help="resnet18")
+parser.add_argument('--dataset', default="cifar100", type=str, help="cifar100")
+parser.add_argument('--epoch', default=300, type=int, help="training epochs")
+parser.add_argument('--loss_coefficient', default=0.7, type=float)
+parser.add_argument('--feature_loss_coefficient', default=0.01, type=float)
+parser.add_argument('--dataset_path', default="data", type=str)
+parser.add_argument('--autoaugment', default=True, type=bool)
+parser.add_argument('--temperature', default=3.0, type=float)
+parser.add_argument('--batchsize', default=128, type=int)
+parser.add_argument('--init_lr', default=0.1, type=float)
+args = parser.parse_args()
+print(args)
+
+def CrossEntropy(outputs, targets):
+    log_softmax_outputs = F.log_softmax(outputs / args.temperature, dim=1)
+    softmax_targets = F.softmax(targets / args.teacher_temperature, dim=1)
+    return -(log_softmax_outputs * softmax_targets).sum(dim=1).mean()
+
+if args.autoaugment:
+    transform_train = transforms.Compose([transforms.RandomCrop(32, padding=4, fill=128),
+                                          transforms.RandomHorizontalFlip(), CIFAR10Policy(), transforms.ToTensor(),
+                                          transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
+else:
+    transform_train = transforms.Compose([transforms.RandomCrop(32, padding=4, fill=128),
+                                          transforms.RandomHorizontalFlip(), transforms.ToTensor(),
+                                          transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                                               (0.2023, 0.1994, 0.2010))])
+
+transform_test = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+])
+if args.dataset == "cifar100":
+    trainset = torchvision.datasets.CIFAR100(
+        root=args.dataset_path,
+        train=True,
+        download=True,
+        transform=transform_train
+    )
+    testset = torchvision.datasets.CIFAR100(
+        root=args.dataset_path,
+        train=False,
+        download=True,
+        transform=transform_test
+    )
+trainloader = torch.utils.data.DataLoader(
+    trainset,
+    batch_size=args.batchsize,
+    shuffle=True,
+    num_workers=4
+)
+testloader = torch.utils.data.DataLoader(
+    testset,
+    batch_size=args.batchsize,
+    shuffle=False,
+    num_workers=4
+)
+if args.model == "vgg11":
+    net = vgg11(num_classes=100)
+if args.model == "vgg16":
+    net = vgg16(num_classes=100)
+ if args.model == "ShuffleV2":
+    net = ShuffleV2(num_classes=100)
+if args.model == "resnet18":
+    net = resnet18()
+if args.model == "SEresnet34":
+    net = SEresnet34()
+
+net.to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.SGD(net.parameters(), lr=args.init_lr, weight_decay=5e-4, momentum=0.9)
+init = False
+
+def self_distillation_ensemble(outputs, labels):
+    """
+    outputs: 包含四个输出的列表，格式为 [outputs[0], outputs[1], outputs[2], outputs[3]]
+              每个tensor形状为 (batch_size, num_classes)
+    labels: 真实标签，形状为 (batch_size,)
+    返回优化后的集成预测结果 best_ensemble
+    """
+    device = outputs[0].device
+    batch_size = outputs[0].shape[0]
+
+    best_ensemble = outputs[0].detach().clone()
+    preds = [torch.argmax(output, dim=1) for output in outputs]
+
+    for i in range(batch_size):
+        main_pred = preds[0][i]
+        true_label = labels[i]
+
+        if main_pred != true_label:  # 主干预测错误时处理
+            correct_outputs = []
+            # 按分支重要性顺序检查：outputs[3]->outputs[2]->outputs[1]
+            for branch_idx in [1, 2, 3]:
+                if preds[branch_idx][i] == true_label:
+                    correct_outputs.append(outputs[branch_idx][i])
+            if len(correct_outputs) > 0:
+                avg_prob = torch.stack(correct_outputs).mean(dim=0)
+                best_ensemble[i] = avg_prob.to(device)
+        else:  # 新增：主干预测正确时处理
+            correct_outputs = [outputs[0][i]]  # 包含主干输出
+            # 检查所有其他分支
+            for branch_idx in [1, 2, 3]:
+                if preds[branch_idx][i] == true_label:
+                    correct_outputs.append(outputs[branch_idx][i])
+            # 至少存在一个其他正确分支时进行集成
+            if len(correct_outputs) >= 2:
+                avg_prob = torch.stack(correct_outputs).mean(dim=0)
+                best_ensemble[i] = avg_prob.to(device)
+
+    return best_ensemble
+
+if __name__ == "__main__":
+    best_acc = 0
+    best_acc_0 = 0
+    for epoch in range(args.epoch):
+        correct = [0 for _ in range(6)]
+        predicted = [0 for _ in range(6)]
+        if epoch in [args.epoch // 3, args.epoch * 2 // 3, args.epoch - 10]:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] /= 10
+        net.train()
+        sum_loss, total = 0.0, 0.0
+        for i, data in enumerate(trainloader, 0):
+            length = len(trainloader)
+            inputs, labels = data
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs, outputs_feature = net(inputs)
+
+            if init is False:
+                #   init the adaptation layers.
+                #   we add feature adaptation layers here to soften the influence from feature distillation loss
+                #   the feature distillation in our conference version :  | f1-f2 | ^ 2
+                #   the feature distillation in the final version : |Fully Connected Layer(f1) - f2 | ^ 2
+                layer_list = []
+                teacher_feature_size = outputs_feature[0].size(1)
+                for index in range(1, len(outputs_feature)):
+                    student_feature_size = outputs_feature[index].size(1)
+                    layer_list.append(nn.Linear(student_feature_size, teacher_feature_size))
+                net.adaptation_layers = nn.ModuleList(layer_list)
+                net.adaptation_layers.to(device)
+                optimizer = optim.SGD(net.parameters(), lr=args.init_lr, weight_decay=5e-4, momentum=0.9)
+                #   define the optimizer here again so it will optimize the net.adaptation_layers
+                init = True
+
+            #   compute loss
+            loss = torch.FloatTensor([0.]).to(device)
+
+            teacher_output = outputs[0].detach()
+            teacher_feature = outputs_feature[0].detach()
+
+            ensemble = self_distillation_ensemble(outputs[1:], labels)
+            ensemble.detach_()
+
+            for index in range(0, len(outputs)):
+                #   logits distillation
+                loss += criterion(outputs[index], labels) * (1 - args.loss_coefficient)
+                loss += CrossEntropy(outputs[index], ensemble.detach()) * args.loss_coefficient
+
+            for index in range(0, len(outputs_feature)):
+                if index > 1:
+                    loss += torch.dist(net.adaptation_layers[index - 1](outputs_feature[index]), teacher_feature) * \
+                            args.feature_loss_coefficient
+
+            sum_loss += loss.item()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total += float(labels.size(0))
+            outputs.append(ensemble)
+
+            for classifier_index in range(len(outputs)):
+                _, predicted[classifier_index] = torch.max(outputs[classifier_index].data, 1)
+                correct[classifier_index] += float(predicted[classifier_index].eq(labels.data).cpu().sum())
+            print('[epoch:%d, iter:%d] Loss: %.03f | Acc: backbone: %.2f%%  4/4: %.2f%% 3/4: %.2f%% 2/4: %.2f%%  1/4: %.2f%%'
+                  ' Ensemble: %.2f%%' % (epoch + 1, (i + 1 + epoch * length), sum_loss / (i + 1),
+                                         100 * correct[0] / total, 100 * correct[1] / total,
+                                         100 * correct[2] / total, 100 * correct[3] / total,
+                                         100 * correct[4] / total, 100 * correct[5] / total))
+
+        print("Waiting Test!")
+        with torch.no_grad():
+            correct = [0 for _ in range(6)]
+            predicted = [0 for _ in range(6)]
+            total = 0.0
+            for data in testloader:
+                net.eval()
+                images, labels = data
+                images, labels = images.to(device), labels.to(device)
+                outputs, outputs_feature = net(images)
+                ensemble = sum(outputs[1:]) / len(outputs)
+                outputs.append(ensemble)
+                for classifier_index in range(len(outputs)):
+                    _, predicted[classifier_index] = torch.max(outputs[classifier_index].data, 1)
+                    correct[classifier_index] += float(predicted[classifier_index].eq(labels.data).cpu().sum())
+                total += float(labels.size(0))
+
+            print('Test Set AccuracyAcc: backbone: %.4f%%  4/4: %.4f%% 3/4: %.4f%% 2/4: %.4f%%  1/4: %.4f%%'
+                  ' Ensemble: %.4f%%' % (100 * correct[0] / total, 100 * correct[1] / total,
+                                         100 * correct[2] / total, 100 * correct[3] / total,
+                                         100 * correct[4] / total, 100 * correct[5] / total))
+            if correct[0] / total > best_acc_0:
+                best_acc_0 = correct[0] / total
+                print("Best Backbone Accuracy Updated: ", best_acc_0 * 100)
+
+            if correct[5] / total > best_acc:
+                best_acc = correct[5] / total
+                print("Best Accuracy Updated: ", best_acc * 100)
+                torch.save(net.state_dict(), "./checkpoints/" + str(args.model) + "_ETSKD.pth")
+
+    print("Training Finished, TotalEPOCH=%d, Best Backbone Accuracy=%.3f, Best Accuracy=%.3f" % (args.epoch, best_acc_0, best_acc))
