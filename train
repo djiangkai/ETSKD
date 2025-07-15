@@ -185,3 +185,5 @@ if __name__ == "__main__":
                 torch.save(net.state_dict(), "./checkpoints/" + str(args.model) + "_ETSKD.pth")
 
     print("Training Finished, TotalEPOCH=%d, Best Backbone Accuracy=%.3f, Best Accuracy=%.3f" % (args.epoch, best_acc_0, best_acc))
+#This code draws on the work described in:  
+#Zhang, L., Song, J., Gao, A., Chen, J., Bao, C., & Ma, K. (2019). Be your own teacher: Improve the performance of convolutional neural networks via self distillation. In *Proceedings of the IEEE/CVF International Conference on Computer Vision* (pp. 3713–3722).
