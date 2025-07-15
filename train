@@ -85,44 +85,6 @@ criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.init_lr, weight_decay=5e-4, momentum=0.9)
 init = False
 
-def self_distillation_ensemble(outputs, labels):
-    """
-    outputs: 包含四个输出的列表，格式为 [outputs[0], outputs[1], outputs[2], outputs[3]]
-              每个tensor形状为 (batch_size, num_classes)
-    labels: 真实标签，形状为 (batch_size,)
-    返回优化后的集成预测结果 best_ensemble
-    """
-    device = outputs[0].device
-    batch_size = outputs[0].shape[0]
-
-    best_ensemble = outputs[0].detach().clone()
-    preds = [torch.argmax(output, dim=1) for output in outputs]
-
-    for i in range(batch_size):
-        main_pred = preds[0][i]
-        true_label = labels[i]
-
-        if main_pred != true_label:  # 主干预测错误时处理
-            correct_outputs = []
-            # 按分支重要性顺序检查：outputs[3]->outputs[2]->outputs[1]
-            for branch_idx in [1, 2, 3]:
-                if preds[branch_idx][i] == true_label:
-                    correct_outputs.append(outputs[branch_idx][i])
-            if len(correct_outputs) > 0:
-                avg_prob = torch.stack(correct_outputs).mean(dim=0)
-                best_ensemble[i] = avg_prob.to(device)
-        else:  # 新增：主干预测正确时处理
-            correct_outputs = [outputs[0][i]]  # 包含主干输出
-            # 检查所有其他分支
-            for branch_idx in [1, 2, 3]:
-                if preds[branch_idx][i] == true_label:
-                    correct_outputs.append(outputs[branch_idx][i])
-            # 至少存在一个其他正确分支时进行集成
-            if len(correct_outputs) >= 2:
-                avg_prob = torch.stack(correct_outputs).mean(dim=0)
-                best_ensemble[i] = avg_prob.to(device)
-
-    return best_ensemble
 
 if __name__ == "__main__":
     best_acc = 0
