@@ -199,23 +199,6 @@ class SFFM(nn.Module):
         # 融合输出
         return torch.sigmoid(self.gamma) * x_freq + (1 - torch.sigmoid(self.gamma)) * x_local + x
 
-    def _get_low_freq_mask(self, h, w, device):
-        """动态生成掩码"""
-        ratio = torch.sigmoid(self.ratio) * 0.6 + 0.2
-        sigma = ratio * 0.8 + 0.1
-
-        y = torch.linspace(-1, 1, h, device=device).view(-1, 1)
-        x = torch.linspace(-1, 1, w, device=device).view(1, -1)
-        dist = torch.sqrt(y ** 2 + x ** 2)
-
-        mask = torch.exp(-dist / (2 * sigma ** 2))
-        return mask.unsqueeze(0)  # [1, h, w]
-
-    def _init_params(self):
-        nn.init.constant_(self.ratio, -1.0)
-        nn.init.kaiming_normal_(self.conv_local.weight, mode='fan_out')
-        if self.conv_local.bias is not None:
-            nn.init.zeros_(self.conv_local.bias)
 
 class ResNet(nn.Module):
 
