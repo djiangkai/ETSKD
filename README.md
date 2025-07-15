@@ -1,5 +1,4 @@
 # ETSKD
-![image](https://github.com/user-attachments/assets/1b7e54d7-90a3-4db8-aa00-abf7482a4a8c)
 
 Parameter Settings (such as α, β)
 α: This hyperparameter balances the contribution of the cross - entropy (CE) loss and the KL - divergence loss between the auxiliary branches' logits and the elite teacher's logits. As shown in our ablation study on ResNet - 18 in Table 6, when α is large, the LSKD loss term becomes too small, and network performance decreases significantly. We found that α = 0.3 yields the best performance on the CIFAR - 100 dataset for ResNet - 18. For other datasets and network architectures, we suggest researchers start with α = 0.3 and then perform a small - scale grid search (e.g., try α values in the range of [0.2, 0.4] with a step of 0.05) to find the optimal value. The optimal α may vary depending on the complexity of the network, the size of the dataset, and the nature of the classification task.
