@@ -1,0 +1,353 @@
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import torch.fft
+
+__all__ = ['vgg11', 'vgg16']
+
+
+# class AFFM(nn.Module):
+#     def __init__(self, channels):
+#         """
+#         自适应频域融合模块 (Adaptive Frequency Fusion Module)
+#         参数:
+#             channels (int): 输入特征图的通道数
+#         """
+#         super().__init__()
+#         # 自适应权重生成层 (通道注意力)
+#         self.conv_alpha = nn.Sequential(
+#             nn.Conv2d(channels, channels, kernel_size=1),
+#             nn.BatchNorm2d(channels),  # 新增批归一化层[3](@ref)
+#             nn.ReLU(inplace=True)  # 新增非线性激活[4](@ref)
+#         )
+#         # 局部特征提取层
+#         self.conv_local = nn.Conv2d(channels, channels, kernel_size=1)
+#
+#         # 融合权重参数
+#         self.gamma1 = nn.Parameter(torch.ones(1))  # 频域分支权重
+#         self.gamma2 = nn.Parameter(torch.ones(1))  # 局部分支权重
+#
+#         self._init_weights()  # 初始化调用
+#
+#     def forward(self, x):
+#         """
+#         前向传播过程
+#         输入:
+#             x (Tensor): 形状为[B, C, H, W]的特征图
+#         输出:
+#             Tensor: 增强后的特征图
+#         """
+#         # FFT转换与频域分解
+#         fft = torch.fft.fft2(x, norm='ortho')  # 执行2D FFT变换
+#         fft_shift = torch.fft.fftshift(fft)  # 将低频移到中心
+#         c, h, w = x.shape[1], x.shape[2], x.shape[3]
+#         mask_low = self._get_low_freq_mask(c, h, w).to(x.device)
+#
+#         # 分离低频和高频分量
+#         fft_low = fft_shift * mask_low  # 低频区域[3](@ref)
+#         fft_high = fft_shift * (1 - mask_low)  # 高频区域
+#
+#         # 自适应权重生成 (通道级注意力)
+#         alpha = torch.sigmoid(self.conv_alpha(x))  # 生成[0,1]权重[4](@ref)
+#         beta = 1 - alpha  # 互补权重
+#
+#         # 频域融合与逆变换
+#         fft_fused = alpha * fft_low + beta * fft_high  # 加权融合[3](@ref)
+#         x_freq = torch.fft.ifft2(
+#             torch.fft.ifftshift(fft_fused),
+#             norm='ortho'
+#         ).real  # 逆变换回空间域
+#
+#         # 局部特征融合
+#         x_local = self.conv_local(x)  # 空间域局部特征[4](@ref)
+#         # 残差连接融合 (gamma1, gamma2为可学习权重)
+#         return self.gamma1 * x_freq + self.gamma2 * x_local + x
+#         # return x_local + x
+#
+#     def _get_low_freq_mask(self, c, h, w, ratio=0.7):
+#         """
+#         生成低频区域掩码
+#         参数:
+#             c (int): 通道数
+#             h (int): 高度
+#             w (int): 宽度
+#             ratio (float): 低频区域占比(默认中心20%区域)
+#         返回:
+#             Tensor: 低频掩码，形状为[C, H, W]
+#         """
+#         ch, cw = int(h * ratio), int(w * ratio)
+#         mask = torch.zeros((c, h, w))
+#         # 中心区域设置为1 (低频部分)
+#         mask[:, h // 2 - ch:h // 2 + ch, w // 2 - cw:w // 2 + cw] = 1
+#         return mask
+#
+#     def _init_weights(self):
+#         for m in self.modules():
+#             if isinstance(m, nn.Conv2d):
+#                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+#                 if m.bias is not None: nn.init.zeros_(m.bias)
+class SepConv(nn.Module):
+
+    def __init__(self, channel_in, channel_out, kernel_size=3, stride=2, padding=1, affine=True):
+        super(SepConv, self).__init__()
+        self.op = nn.Sequential(
+            nn.Conv2d(channel_in, channel_in, kernel_size=kernel_size, stride=stride, padding=padding,
+                      groups=channel_in, bias=False),
+            nn.Conv2d(channel_in, channel_in, kernel_size=1, padding=0, bias=False),
+            nn.BatchNorm2d(channel_in, affine=affine),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(channel_in, channel_in, kernel_size=kernel_size, stride=1, padding=padding, groups=channel_in,
+                      bias=False),
+            nn.Conv2d(channel_in, channel_out, kernel_size=1, padding=0, bias=False),
+            nn.BatchNorm2d(channel_out, affine=affine),
+            nn.ReLU(inplace=False),
+        )
+
+    def forward(self, x):
+        return self.op(x)
+
+class LightSELayer(nn.Module):
+    """轻量级复数SE模块（针对CIFAR优化）"""
+
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels * 2, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c = x.size()[:2]
+        y = self.gap(x).view(b, c)
+        # 合并实虚部特征
+        y_combined = torch.cat([y.real, y.imag], dim=1)
+        scale = self.fc(y_combined).view(b, c, 1, 1)
+        return x * scale.expand_as(x)
+
+class SFFM(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.ratio = nn.Parameter(torch.tensor(-1.0))
+        self.se_low = LightSELayer(channels)
+        self.se_high = LightSELayer(channels)
+        self.conv_local = nn.Conv2d(channels, channels, 1)
+        self.gamma = nn.Parameter(torch.tensor([0.5]))
+        self._init_params()
+
+    def forward(self, x):
+        # 动态获取尺寸
+        h, w = x.shape[2], x.shape[3]
+
+        # 生成动态掩码
+        adjusted_mask = self._get_low_freq_mask(h, w, x.device)
+
+        # FFT处理
+        fft = torch.fft.fft2(x, norm='ortho')
+        fft_shift = torch.fft.fftshift(fft)
+
+        # 频域增强
+        fft_low = self.se_low(fft_shift * adjusted_mask)
+        fft_high = self.se_high(fft_shift * (1 - adjusted_mask))
+
+        # 逆变换
+        fft_fused = 0.3 * fft_low + 0.7 * fft_high
+        x_freq = torch.fft.ifft2(
+            torch.fft.ifftshift(fft_fused),
+            norm='ortho'
+        ).real
+
+        # 空间特征
+        x_local = self.conv_local(x)
+
+        # 融合输出
+        return torch.sigmoid(self.gamma) * x_freq + (1 - torch.sigmoid(self.gamma)) * x_local + x
+
+
+
+class VGG(nn.Module):
+    def __init__(self, cfg, batch_norm=False, num_classes=100):
+        super(VGG, self).__init__()
+        # 原始特征提取层
+        self.block0 = self._make_layers(cfg[0], batch_norm, 3)
+        # 插入AFFM模块 (关键修改点)
+        self.affm_after_layer0 = SFFM(channels=64)  # 通道数与layer1输出一致
+
+        self.block1 = self._make_layers(cfg[1], batch_norm, cfg[0][-1])
+        # 插入AFFM模块 (关键修改点)
+        self.affm_after_layer1 = SFFM(channels=128)  # 通道数与layer1输出一致
+
+        self.block2 = self._make_layers(cfg[2], batch_norm, cfg[1][-1])
+        # 插入AFFM模块 (关键修改点)
+        self.affm_after_layer2 = SFFM(channels=256)  # 通道数与layer1输出一致
+
+        self.block3 = self._make_layers(cfg[3], batch_norm, cfg[2][-1])
+        self.affm_after_layer3 = SFFM(channels=512)  # 通道数与layer1输出一致
+
+        self.block4 = self._make_layers(cfg[4], batch_norm, cfg[3][-1])
+        self.affm_after_layer4 = SFFM(channels=512)  # 通道数与layer1输出一致
+
+        # 池化层
+        self.pool0 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool4 = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.scala1 = nn.Sequential(
+            # SepConv(
+            #     channel_in=64,
+            #     channel_out=128,
+            # ),
+            SepConv(
+                channel_in=128,
+                channel_out=256,
+            ),
+            SepConv(
+                channel_in=256,
+                channel_out=512,
+            ),
+            nn.AvgPool2d(4, 4)
+        )
+
+        self.scala2 = nn.Sequential(
+            # SepConv(
+            #     channel_in=128,
+            #     channel_out=256,
+            # ),
+            SepConv(
+                channel_in=256,
+                channel_out=512,
+            ),
+            nn.AvgPool2d(4, 4)
+        )
+        self.scala3 = nn.AvgPool2d(4, 4)
+        self.scala4 = nn.AvgPool2d(4, 4)
+        self.scala5 = nn.AvgPool2d(4, 4)
+
+        self.fc1 = nn.Linear(512, num_classes)
+        self.fc2 = nn.Linear(512, num_classes)
+        self.fc3 = nn.Linear(512, num_classes)
+        self.fc4 = nn.Linear(512, num_classes)
+        self.fc5 = nn.Linear(512, num_classes)
+
+    def forward(self, x):
+        feature_list = []
+        # Block0处理
+        x = F.relu(self.block0(x))
+
+        # f0 = self.affm_after_layer0(x)
+        # out0 = self.aux_classifier0(f0)
+
+        # Block1处理
+        x = self.pool0(x)
+        x = self.block1(x)
+        x = F.relu(x)
+
+        fea1 = self.affm_after_layer1(x)
+        feature_list.append(fea1)
+
+        # Block2处理
+        x = self.pool1(x)
+        x = self.block2(x)
+        x = F.relu(x)
+
+        fea2 = self.affm_after_layer2(x)
+        feature_list.append(fea2)
+
+        # 后续处理（保持不变）
+        x = self.pool2(x)
+        x = self.block3(x)
+        x = F.relu(x)
+
+        fea3 = self.affm_after_layer3(x)
+        feature_list.append(fea3)
+
+        if x.shape[2] == 8:  # 特殊尺寸处理
+            x = self.pool3(x)
+        x = self.block4(x)
+
+        x = F.relu(x)
+        fea4 = self.affm_after_layer4(x)
+        feature_list.append(fea4)
+        feature_list.append(x)
+
+        out1_feature = self.scala1(feature_list[0]).view(x.size(0), -1)
+        out2_feature = self.scala2(feature_list[1]).view(x.size(0), -1)
+        out3_feature = self.scala3(feature_list[2]).view(x.size(0), -1)
+        out4_feature = self.scala4(feature_list[3]).view(x.size(0), -1)
+        out5_feature = self.scala5(feature_list[4]).view(x.size(0), -1)
+
+        out1 = self.fc1(out1_feature)
+        out2 = self.fc2(out2_feature)
+        out3 = self.fc3(out3_feature)
+        out4 = self.fc4(out4_feature)
+        out5 = self.fc5(out5_feature)
+        # print(feature_list[0].size(),feature_list[1].size(),feature_list[2].size(),feature_list[3].size())
+        # print(out1_feature.size(),out2_feature.size(),out3_feature.size(),out4_feature.size())
+        # 返回结果
+        return [out5, out4, out3, out2, out1], [out4_feature, out3_feature, out2_feature, out1_feature]
+
+    @staticmethod
+    def _make_layers(cfg, batch_norm=False, in_channels=3):
+        layers = []
+        for v in cfg:
+            if v == 'M':
+                layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+            else:
+                conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
+                if batch_norm:
+                    layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
+                else:
+                    layers += [conv2d, nn.ReLU(inplace=True)]
+                in_channels = v
+        layers = layers[:-1]
+        return nn.Sequential(*layers)
+
+    ############## 修改后的初始化方法 ##############
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+                if m.bias is not None:
+                    m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.Linear):
+                # 同时初始化主分类器和辅助分类器的权重
+                if m in [self.classifier, self.aux_classifier0[-1],
+                         self.aux_classifier1[-1], self.aux_classifier2[-1]]:
+                    n = m.weight.size(1)
+                    m.weight.data.normal_(0, 0.01)
+                    m.bias.data.zero_()
+
+
+cfg = {
+    'A': [[64], [128], [256, 256], [512, 512], [512, 512]],
+    'B': [[64, 64], [128, 128], [256, 256], [512, 512], [512, 512]],
+    'D': [[64, 64], [128, 128], [256, 256, 256], [512, 512, 512], [512, 512, 512]],
+    'E': [[64, 64], [128, 128], [256, 256, 256, 256], [512, 512, 512, 512], [512, 512, 512, 512]],
+    'S': [[64], [128], [256], [512], [512]],
+}
+
+
+def vgg11(**kwargs):
+    """VGG 11-layer model (configuration "A")
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    model = VGG(cfg['A'], **kwargs)
+    return model
+
+
+def vgg16(**kwargs):
+    """VGG 16-layer model (configuration "D")
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    model = VGG(cfg['D'], **kwargs)
+    return model
