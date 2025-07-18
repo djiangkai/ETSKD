@@ -92,7 +92,7 @@ if __name__ == "__main__":
     for epoch in range(args.epoch):
         correct = [0 for _ in range(6)]
         predicted = [0 for _ in range(6)]
-        if epoch in [args.epoch // 3, args.epoch * 2 // 3, args.epoch - 10]:
+        if epoch in [150，,225]:
             for param_group in optimizer.param_groups:
                 param_group['lr'] /= 10
         net.train()
